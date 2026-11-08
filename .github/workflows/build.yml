@@ -1,0 +1,1716 @@
+name: Build Ringan Launcher
+
+# Satu file ini sudah berisi seluruh source project.
+# Setiap push ke branch main (atau tombol Run workflow) akan membangun APK
+# dan menerbitkannya di halaman Releases repo ini.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Tulis source project
+        run: |
+          mkdir -p app app/src/main app/src/main/java/id/ringan/launcher app/src/main/res/drawable app/src/main/res/layout app/src/main/res/values
+          cat > app/build.gradle.kts <<'EOF_RINGAN'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "id.ringan.launcher"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "id.ringan.launcher"
+                  minSdk = 21
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "1.1"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+                      // Ditandatangani dengan kunci debug supaya APK release langsung bisa dipasang
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+          }
+
+          dependencies {
+              implementation("androidx.recyclerview:recyclerview:1.3.2")
+          }
+          EOF_RINGAN
+          cat > app/src/main/AndroidManifest.xml <<'EOF_RINGAN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature
+                  android:name="android.software.leanback"
+                  android:required="false" />
+              <uses-feature
+                  android:name="android.hardware.touchscreen"
+                  android:required="false" />
+
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+              <uses-permission
+                  android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:banner="@drawable/banner"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="Ringan Launcher"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:clearTaskOnLaunch="true"
+                      android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|uiMode"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:stateNotNeeded="true">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".SettingsActivity"
+                      android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|uiMode"
+                      android:exported="false" />
+
+                  <activity
+                      android:name=".WallpaperActivity"
+                      android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|uiMode"
+                      android:exported="false" />
+
+                  <activity
+                      android:name=".ManageAppsActivity"
+                      android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|uiMode"
+                      android:exported="false" />
+              </application>
+          </manifest>
+          EOF_RINGAN
+          cat > app/src/main/java/id/ringan/launcher/Apps.kt <<'EOF_RINGAN'
+          package id.ringan.launcher
+
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.drawable.Drawable
+          import android.util.LruCache
+
+          class AppEntry(val label: String, val pkg: String, val intent: Intent)
+
+          object AppLoader {
+              /** Semua aplikasi yang bisa dibuka, urut abjad (kecuali launcher ini sendiri). */
+              fun loadAll(ctx: Context): List<AppEntry> {
+                  val pm = ctx.packageManager
+                  val seen = HashSet<String>()
+                  val result = ArrayList<AppEntry>()
+                  // Kategori leanback didahulukan agar aplikasi TV memakai entri TV-nya
+                  val categories = arrayOf(Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER)
+                  for (category in categories) {
+                      val query = Intent(Intent.ACTION_MAIN).addCategory(category)
+                      for (info in pm.queryIntentActivities(query, 0)) {
+                          val pkg = info.activityInfo.packageName
+                          if (pkg == ctx.packageName || !seen.add(pkg)) continue
+                          val launch = Intent(Intent.ACTION_MAIN)
+                              .addCategory(category)
+                              .setComponent(ComponentName(pkg, info.activityInfo.name))
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                          result.add(AppEntry(info.loadLabel(pm).toString(), pkg, launch))
+                      }
+                  }
+                  result.sortBy { it.label.lowercase() }
+                  return result
+              }
+          }
+
+          object IconCache {
+              private val cache = LruCache<String, Drawable>(120)
+
+              fun get(ctx: Context, app: AppEntry): Drawable? {
+                  val cached = cache.get(app.pkg)
+                  if (cached != null) {
+                      return cached.constantState?.newDrawable() ?: cached
+                  }
+                  return try {
+                      val icon = ctx.packageManager.getActivityIcon(app.intent)
+                      cache.put(app.pkg, icon)
+                      icon.constantState?.newDrawable() ?: icon
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+          }
+          EOF_RINGAN
+          cat > app/src/main/java/id/ringan/launcher/ListPage.kt <<'EOF_RINGAN'
+          package id.ringan.launcher
+
+          import android.app.Activity
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.view.ViewGroup
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+
+          /**
+           * Kerangka layar pengaturan: judul, petunjuk, dan daftar yang bisa dipilih dengan D-pad.
+           * Warna mengikuti tema yang sedang dipilih.
+           */
+          abstract class ListPage : Activity() {
+
+              protected lateinit var prefs: Prefs
+              protected lateinit var look: Look
+              protected lateinit var listView: ListView
+
+              private lateinit var root: LinearLayout
+              private lateinit var titleView: TextView
+              private lateinit var hintView: TextView
+
+              protected abstract val pageTitle: String
+              protected abstract val pageHint: String
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = Prefs(this)
+                  look = Look(this, prefs)
+
+                  root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(look.dp(56), look.dp(32), look.dp(56), look.dp(16))
+
+                  titleView = TextView(this)
+                  titleView.text = pageTitle
+                  titleView.textSize = 28f
+                  titleView.typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+                  root.addView(titleView)
+
+                  hintView = TextView(this)
+                  hintView.text = pageHint
+                  hintView.textSize = 14f
+                  hintView.setPadding(0, look.dp(4), 0, look.dp(12))
+                  root.addView(hintView)
+
+                  listView = ListView(this)
+                  listView.divider = null
+                  listView.dividerHeight = 0
+                  listView.isVerticalScrollBarEnabled = false
+                  root.addView(
+                      listView,
+                      LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+                  )
+
+                  setContentView(root)
+                  applyLook()
+              }
+
+              protected fun applyLook() {
+                  look = Look(this, prefs)
+                  root.background = look.background()
+                  titleView.setTextColor(look.textPrimary)
+                  hintView.setTextColor(look.textSecondary)
+                  listView.selector = look.rowSelector()
+              }
+          }
+          EOF_RINGAN
+          cat > app/src/main/java/id/ringan/launcher/Look.kt <<'EOF_RINGAN'
+          package id.ringan.launcher
+
+          import android.content.Context
+          import android.content.res.ColorStateList
+          import android.graphics.Color
+          import android.graphics.drawable.ColorDrawable
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.InsetDrawable
+          import android.graphics.drawable.StateListDrawable
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.drawable.BitmapDrawable
+          import android.graphics.drawable.LayerDrawable
+          import java.io.File
+
+          /**
+           * Tema visual yang dihitung dari pengaturan: warna, ukuran, dan semua drawable.
+           * Dibuat ulang setiap kali pengaturan berubah.
+           */
+          class Look(ctx: Context, p: Prefs) {
+
+              private val appCtx: Context = ctx.applicationContext
+              private val dimIndex: Int = p.dim
+              private val density = ctx.resources.displayMetrics.density
+
+              fun dp(v: Int): Int = (v * density + 0.5f).toInt()
+
+              val accent: Int = Prefs.ACCENTS[p.accent]
+              private val bgIndex: Int = p.background
+              val light: Boolean = bgIndex == 6
+              private val cardStyle: Int = p.cardStyle
+
+              val textPrimary: Int = if (light) Color.parseColor("#1A1F26") else Color.WHITE
+              val textSecondary: Int =
+                  if (light) Color.parseColor("#5B6673") else Color.parseColor("#9AA6B5")
+
+              val iconDp: Int = intArrayOf(48, 64, 84)[p.iconSize]
+              val iconPx: Int = dp(iconDp)
+              val labelSp: Float = floatArrayOf(12f, 14f, 16f)[p.iconSize]
+              private val radiusPx: Float = dp(intArrayOf(6, 16, 28)[p.radius]).toFloat()
+
+              private fun solid(hex: String): Drawable = ColorDrawable(Color.parseColor(hex))
+
+              private fun gradient(from: String, to: String): Drawable =
+                  GradientDrawable(
+                      GradientDrawable.Orientation.TL_BR,
+                      intArrayOf(Color.parseColor(from), Color.parseColor(to))
+                  )
+
+              fun background(): Drawable = when (bgIndex) {
+                  0 -> solid("#0F1217")
+                  1 -> solid("#000000")
+                  2 -> SoftBackground.aurora()
+                  3 -> SoftBackground.ocean()
+                  4 -> SoftBackground.forest()
+                  5 -> SoftBackground.dusk()
+                  6 -> solid("#EEF1F5")
+                  else -> photo()
+              }
+
+              /** Foto latar pilihan sendiri (sudah dipotong 16:9), diredupkan agar teks tetap terbaca. */
+              private fun photo(): Drawable {
+                  val file = File(appCtx.filesDir, "wallpaper.jpg")
+                  var bitmap: Bitmap? = null
+                  if (file.exists()) {
+                      val options = BitmapFactory.Options()
+                      options.inPreferredConfig = Bitmap.Config.RGB_565
+                      bitmap = BitmapFactory.decodeFile(file.path, options)
+                  }
+                  if (bitmap == null) return solid("#0F1217")
+                  val alpha = intArrayOf(0, 64, 128, 191)[dimIndex]
+                  val layers = arrayOf<Drawable>(
+                      BitmapDrawable(appCtx.resources, bitmap),
+                      ColorDrawable(Color.argb(alpha, 0, 0, 0))
+                  )
+                  return LayerDrawable(layers)
+              }
+
+              private fun focusedCard(): GradientDrawable {
+                  val d = GradientDrawable()
+                  d.setCornerRadius(radiusPx)
+                  val alpha = if (light) 40 else 55
+                  d.setColor(Color.argb(alpha, Color.red(accent), Color.green(accent), Color.blue(accent)))
+                  d.setStroke(dp(3), accent)
+                  return d
+              }
+
+              /** Latar kartu aplikasi: gaya sesuai pilihan, dan bingkai warna aksen saat difokus. */
+              fun cardBackground(): Drawable {
+                  val normal = GradientDrawable()
+                  normal.setCornerRadius(radiusPx)
+                  val fill = when (cardStyle) {
+                      0 -> if (light) Color.WHITE else Color.parseColor("#1D232B")
+                      1 -> if (light) Color.parseColor("#99FFFFFF") else Color.parseColor("#1AFFFFFF")
+                      else -> Color.TRANSPARENT
+                  }
+                  normal.setColor(fill)
+
+                  val states = StateListDrawable()
+                  states.addState(intArrayOf(android.R.attr.state_focused), focusedCard())
+                  states.addState(intArrayOf(), normal)
+                  return states
+              }
+
+              /** Sorotan baris pada layar pengaturan (ListView). */
+              fun rowSelector(): Drawable = InsetDrawable(focusedCard(), dp(2))
+
+              /** Tombol bentuk pil di bagian atas. */
+              fun pillBackground(): Drawable {
+                  val normal = GradientDrawable()
+                  normal.setCornerRadius(dp(22).toFloat())
+                  normal.setColor(if (light) Color.parseColor("#14000000") else Color.parseColor("#1FFFFFFF"))
+
+                  val focused = GradientDrawable()
+                  focused.setCornerRadius(dp(22).toFloat())
+                  focused.setColor(accent)
+
+                  val states = StateListDrawable()
+                  states.addState(intArrayOf(android.R.attr.state_focused), focused)
+                  states.addState(intArrayOf(), normal)
+                  return states
+              }
+
+              fun pillTextColors(): ColorStateList =
+                  ColorStateList(
+                      arrayOf(intArrayOf(android.R.attr.state_focused), intArrayOf()),
+                      intArrayOf(Color.WHITE, textPrimary)
+                  )
+          }
+          EOF_RINGAN
+          cat > app/src/main/java/id/ringan/launcher/MainActivity.kt <<'EOF_RINGAN'
+          package id.ringan.launcher
+
+          import android.app.Activity
+          import android.app.ActivityManager
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.KeyEvent
+          import android.view.LayoutInflater
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.ImageView
+          import android.widget.TextClock
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.recyclerview.widget.GridLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import kotlin.math.max
+
+          /**
+           * Layar utama launcher. Tampilan dan daftar aplikasi diatur lewat
+           * tombol "Atur Launcher" (SettingsActivity dan ManageAppsActivity).
+           */
+          class MainActivity : Activity() {
+
+              private lateinit var prefs: Prefs
+              private lateinit var look: Look
+              private lateinit var root: View
+              private lateinit var clock: TextClock
+              private lateinit var date: TextClock
+              private lateinit var ramText: TextView
+              private lateinit var hint: TextView
+              private lateinit var emptyText: TextView
+              private lateinit var btnClean: TextView
+              private lateinit var btnLauncher: TextView
+              private lateinit var btnSettings: TextView
+              private lateinit var list: RecyclerView
+
+              private var apps: List<AppEntry> = emptyList()
+              private var lastSignature = ""
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  root = findViewById<View>(R.id.root)
+                  clock = findViewById<TextClock>(R.id.clock)
+                  date = findViewById<TextClock>(R.id.date)
+                  ramText = findViewById<TextView>(R.id.ram)
+                  hint = findViewById<TextView>(R.id.hint)
+                  emptyText = findViewById<TextView>(R.id.empty)
+                  btnClean = findViewById<TextView>(R.id.btn_clean)
+                  btnLauncher = findViewById<TextView>(R.id.btn_launcher)
+                  btnSettings = findViewById<TextView>(R.id.btn_settings)
+                  list = findViewById<RecyclerView>(R.id.list)
+
+                  btnClean.setOnClickListener { cleanRam() }
+                  btnLauncher.setOnClickListener { openLauncherSettings() }
+                  btnSettings.setOnClickListener { openSystemSettings() }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+                  if (currentFocus == null) focusFirst()
+              }
+
+              override fun onNewIntent(intent: Intent?) {
+                  super.onNewIntent(intent)
+                  // Tombol Home ditekan saat launcher sudah terbuka: kembali ke awal
+                  list.scrollToPosition(0)
+                  focusFirst()
+              }
+
+              // Launcher tidak boleh tertutup oleh tombol Back
+              @Suppress("OVERRIDE_DEPRECATION")
+              override fun onBackPressed() {
+              }
+
+              // Tombol Menu: info aplikasi yang sedang disorot (hapus / nonaktifkan / paksa berhenti),
+              // atau pengaturan launcher jika fokus tidak sedang di aplikasi.
+              override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                  if (event.action == KeyEvent.ACTION_DOWN && event.keyCode == KeyEvent.KEYCODE_MENU) {
+                      val focused = currentFocus
+                      val holder = if (focused != null) list.findContainingViewHolder(focused) else null
+                      val pos = holder?.bindingAdapterPosition ?: RecyclerView.NO_POSITION
+                      if (pos != RecyclerView.NO_POSITION && pos < apps.size) {
+                          showAppInfo(apps[pos])
+                      } else {
+                          openLauncherSettings()
+                      }
+                      return true
+                  }
+                  return super.dispatchKeyEvent(event)
+              }
+
+              private fun refresh() {
+                  prefs = Prefs(this)
+                  val shown = prefs.visible(AppLoader.loadAll(this))
+                  val signature = prefs.signature() + "|" + shown.joinToString(",") { it.pkg }
+                  if (signature != lastSignature) {
+                      lastSignature = signature
+                      look = Look(this, prefs)
+                      apps = shown
+                      applyLook()
+                      buildList()
+                  }
+                  updateRam()
+              }
+
+              private fun applyLook() {
+                  root.background = look.background()
+
+                  clock.setTextColor(look.textPrimary)
+                  date.setTextColor(look.textSecondary)
+                  ramText.setTextColor(look.textSecondary)
+                  hint.setTextColor(look.textSecondary)
+                  emptyText.setTextColor(look.textSecondary)
+
+                  val timeFormat = if (prefs.clockFormat == 0) "HH:mm" else "h:mm a"
+                  clock.format12Hour = timeFormat
+                  clock.format24Hour = timeFormat
+                  val dateFormat = "EEEE, d MMMM"
+                  date.format12Hour = dateFormat
+                  date.format24Hour = dateFormat
+
+                  clock.visibility = if (prefs.showClock == 1) View.VISIBLE else View.GONE
+                  date.visibility = if (prefs.showDate == 1) View.VISIBLE else View.GONE
+                  ramText.visibility = if (prefs.showRam == 1) View.VISIBLE else View.GONE
+
+                  val buttons = arrayOf(btnClean, btnLauncher, btnSettings)
+                  for (button in buttons) {
+                      button.background = look.pillBackground()
+                      button.setTextColor(look.pillTextColors())
+                  }
+              }
+
+              private fun buildList() {
+                  val metrics = resources.displayMetrics
+                  val widthDp = metrics.widthPixels / metrics.density
+                  val chosen = Prefs.COLUMN_VALUES[prefs.columns]
+                  val columns = if (chosen == 0) {
+                      max(3, ((widthDp - 100f) / (look.iconDp + 52)).toInt())
+                  } else {
+                      chosen
+                  }
+
+                  list.layoutManager = GridLayoutManager(this, columns)
+                  list.adapter = AppAdapter(
+                      apps,
+                      look,
+                      prefs.animate == 1,
+                      prefs.showLabel == 1,
+                      { app -> launchApp(app) },
+                      { app -> showAppInfo(app) }
+                  )
+                  emptyText.visibility = if (apps.isEmpty()) View.VISIBLE else View.GONE
+                  focusFirst()
+              }
+
+              private fun focusFirst() {
+                  list.post {
+                      if (apps.isEmpty()) {
+                          btnLauncher.requestFocus()
+                      } else {
+                          list.requestFocus()
+                      }
+                  }
+              }
+
+              private fun launchApp(app: AppEntry) {
+                  try {
+                      startActivity(app.intent)
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Tidak bisa membuka " + app.label, Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun showAppInfo(app: AppEntry) {
+                  try {
+                      val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                          .setData(Uri.parse("package:" + app.pkg))
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(intent)
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Info aplikasi tidak tersedia", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun openLauncherSettings() {
+                  startActivity(Intent(this, SettingsActivity::class.java))
+              }
+
+              private fun openSystemSettings() {
+                  try {
+                      startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Pengaturan TV tidak tersedia", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun updateRam() {
+                  val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                  val info = ActivityManager.MemoryInfo()
+                  am.getMemoryInfo(info)
+                  val free = info.availMem / 1048576L
+                  val total = info.totalMem / 1048576L
+                  ramText.text = "RAM bebas " + free + " / " + total + " MB"
+              }
+
+              private fun cleanRam() {
+                  val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                  for (appInfo in packageManager.getInstalledApplications(0)) {
+                      if (appInfo.packageName != packageName) {
+                          am.killBackgroundProcesses(appInfo.packageName)
+                      }
+                  }
+                  Toast.makeText(this, "RAM dibersihkan", Toast.LENGTH_SHORT).show()
+                  list.postDelayed({ updateRam() }, 1000L)
+              }
+          }
+
+          private class AppAdapter(
+              private val apps: List<AppEntry>,
+              private val look: Look,
+              private val animate: Boolean,
+              private val showLabel: Boolean,
+              private val onClick: (AppEntry) -> Unit,
+              private val onInfo: (AppEntry) -> Unit
+          ) : RecyclerView.Adapter<AppAdapter.VH>() {
+
+              class VH(view: View) : RecyclerView.ViewHolder(view) {
+                  val icon: ImageView = view.findViewById<ImageView>(R.id.icon)
+                  val label: TextView = view.findViewById<TextView>(R.id.label)
+              }
+
+              override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+                  val view = LayoutInflater.from(parent.context).inflate(R.layout.item_app, parent, false)
+                  view.background = look.cardBackground()
+
+                  val holder = VH(view)
+
+                  val iconParams = holder.icon.layoutParams
+                  iconParams.width = look.iconPx
+                  iconParams.height = look.iconPx
+                  holder.icon.layoutParams = iconParams
+
+                  holder.label.setTextColor(look.textPrimary)
+                  holder.label.textSize = look.labelSp
+                  holder.label.visibility = if (showLabel) View.VISIBLE else View.GONE
+
+                  view.setOnClickListener {
+                      val pos = holder.bindingAdapterPosition
+                      if (pos != RecyclerView.NO_POSITION) onClick(apps[pos])
+                  }
+                  view.setOnLongClickListener {
+                      val pos = holder.bindingAdapterPosition
+                      if (pos != RecyclerView.NO_POSITION) onInfo(apps[pos])
+                      true
+                  }
+                  if (animate) {
+                      view.setOnFocusChangeListener { v, hasFocus ->
+                          val scale = if (hasFocus) 1.08f else 1f
+                          val lift = if (hasFocus) look.dp(8).toFloat() else 0f
+                          v.animate().scaleX(scale).scaleY(scale).translationZ(lift).setDuration(120L).start()
+                      }
+                  }
+                  return holder
+              }
+
+              override fun onBindViewHolder(holder: VH, position: Int) {
+                  val app = apps[position]
+                  holder.icon.setImageDrawable(IconCache.get(holder.itemView.context, app))
+                  holder.label.text = app.label
+              }
+
+              override fun onViewRecycled(holder: VH) {
+                  holder.itemView.animate().cancel()
+                  holder.itemView.scaleX = 1f
+                  holder.itemView.scaleY = 1f
+                  holder.itemView.translationZ = 0f
+              }
+
+              override fun getItemCount(): Int = apps.size
+          }
+          EOF_RINGAN
+          cat > app/src/main/java/id/ringan/launcher/ManageAppsActivity.kt <<'EOF_RINGAN'
+          package id.ringan.launcher
+
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          /**
+           * Pilih aplikasi mana yang tampil di launcher.
+           * OK pada sebuah aplikasi memutar: Tampil, Di atas (favorit), Disembunyikan.
+           */
+          class ManageAppsActivity : ListPage() {
+
+              // app == null berarti baris aksi: action 1 = tampilkan semua, 2 = sembunyikan semua
+              private class Item(val app: AppEntry?, val action: Int)
+
+              private class Holder(val icon: ImageView, val name: TextView, val state: TextView)
+
+              override val pageTitle: String
+                  get() = "Aplikasi yang Ditampilkan"
+
+              override val pageHint: String
+                  get() = "OK: ganti Tampil, Di atas (favorit), atau Disembunyikan     Back: selesai"
+
+              private var items: List<Item> = emptyList()
+              private val adapter = ItemAdapter()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val apps = AppLoader.loadAll(this)
+                  items = listOf(Item(null, 1), Item(null, 2)) + apps.map { Item(it, 0) }
+
+                  listView.adapter = adapter
+                  listView.setOnItemClickListener { _, _, position, _ ->
+                      onItemClick(items[position])
+                  }
+                  listView.requestFocus()
+              }
+
+              private fun onItemClick(item: Item) {
+                  val app = item.app
+                  if (app != null) {
+                      prefs.setAppState(app.pkg, (prefs.appState(app.pkg) + 1) % 3)
+                  } else if (item.action == 1) {
+                      prefs.showAll()
+                  } else if (item.action == 2) {
+                      prefs.hideAll(items.mapNotNull { it.app?.pkg })
+                  }
+                  adapter.notifyDataSetChanged()
+              }
+
+              private inner class ItemAdapter : BaseAdapter() {
+                  override fun getCount(): Int = items.size
+
+                  override fun getItem(position: Int): Any = items[position]
+
+                  override fun getItemId(position: Int): Long = position.toLong()
+
+                  override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                      val holder: Holder
+                      val view: View
+                      if (convertView == null) {
+                          val container = LinearLayout(this@ManageAppsActivity)
+                          container.orientation = LinearLayout.HORIZONTAL
+                          container.gravity = Gravity.CENTER_VERTICAL
+                          container.setPadding(look.dp(24), look.dp(10), look.dp(24), look.dp(10))
+
+                          val icon = ImageView(this@ManageAppsActivity)
+                          val iconSize = look.dp(40)
+                          val iconParams = LinearLayout.LayoutParams(iconSize, iconSize)
+                          iconParams.rightMargin = look.dp(16)
+                          container.addView(icon, iconParams)
+
+                          val name = TextView(this@ManageAppsActivity)
+                          name.textSize = 20f
+                          container.addView(
+                              name,
+                              LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                          )
+
+                          val state = TextView(this@ManageAppsActivity)
+                          state.textSize = 16f
+                          container.addView(
+                              state,
+                              LinearLayout.LayoutParams(
+                                  ViewGroup.LayoutParams.WRAP_CONTENT,
+                                  ViewGroup.LayoutParams.WRAP_CONTENT
+                              )
+                          )
+
+                          holder = Holder(icon, name, state)
+                          container.tag = holder
+                          view = container
+                      } else {
+                          view = convertView
+                          holder = convertView.tag as Holder
+                      }
+
+                      val item = items[position]
+                      val app = item.app
+                      if (app == null) {
+                          holder.icon.visibility = View.GONE
+                          holder.name.text =
+                              if (item.action == 1) "Tampilkan semua aplikasi" else "Sembunyikan semua aplikasi"
+                          holder.name.setTextColor(look.accent)
+                          holder.state.text = ""
+                      } else {
+                          val state = prefs.appState(app.pkg)
+                          holder.icon.visibility = View.VISIBLE
+                          holder.icon.setImageDrawable(IconCache.get(this@ManageAppsActivity, app))
+                          holder.name.text = app.label
+                          holder.name.setTextColor(
+                              if (state == 2) look.textSecondary else look.textPrimary
+                          )
+                          when (state) {
+                              1 -> {
+                                  holder.state.text = "★ Di atas"
+                                  holder.state.setTextColor(look.accent)
+                              }
+                              2 -> {
+                                  holder.state.text = "Disembunyikan"
+                                  holder.state.setTextColor(look.textSecondary)
+                              }
+                              else -> {
+                                  holder.state.text = "Tampil"
+                                  holder.state.setTextColor(look.textPrimary)
+                              }
+                          }
+                      }
+                      return view
+                  }
+              }
+          }
+          EOF_RINGAN
+          cat > app/src/main/java/id/ringan/launcher/Prefs.kt <<'EOF_RINGAN'
+          package id.ringan.launcher
+
+          import android.content.Context
+          import android.graphics.Color
+
+          /**
+           * Semua pengaturan launcher. Nilai pilihan disimpan sebagai nomor urut (indeks)
+           * yang sesuai dengan daftar nama di companion object.
+           */
+          class Prefs(ctx: Context) {
+
+              private val lookSp = ctx.getSharedPreferences("look", Context.MODE_PRIVATE)
+              private val appsSp = ctx.getSharedPreferences("apps", Context.MODE_PRIVATE)
+
+              private fun read(key: String, def: Int, count: Int): Int =
+                  lookSp.getInt(key, def).coerceIn(0, count - 1)
+
+              private fun write(key: String, value: Int) {
+                  lookSp.edit().putInt(key, value).apply()
+              }
+
+              var accent: Int
+                  get() = read("accent", 0, ACCENT_NAMES.size)
+                  set(v) = write("accent", v)
+
+              var background: Int
+                  get() = read("bg", 2, BG_NAMES.size)
+                  set(v) = write("bg", v)
+
+              var cardStyle: Int
+                  get() = read("card", 1, CARD_NAMES.size)
+                  set(v) = write("card", v)
+
+              var radius: Int
+                  get() = read("radius", 1, RADIUS_NAMES.size)
+                  set(v) = write("radius", v)
+
+              var iconSize: Int
+                  get() = read("icon", 1, ICON_NAMES.size)
+                  set(v) = write("icon", v)
+
+              var columns: Int
+                  get() = read("cols", 0, COLUMN_NAMES.size)
+                  set(v) = write("cols", v)
+
+              var showLabel: Int
+                  get() = read("label", 1, 2)
+                  set(v) = write("label", v)
+
+              var showClock: Int
+                  get() = read("clock", 1, 2)
+                  set(v) = write("clock", v)
+
+              var clockFormat: Int
+                  get() = read("clockfmt", 0, 2)
+                  set(v) = write("clockfmt", v)
+
+              var showDate: Int
+                  get() = read("date", 1, 2)
+                  set(v) = write("date", v)
+
+              var showRam: Int
+                  get() = read("ram", 1, 2)
+                  set(v) = write("ram", v)
+
+              var animate: Int
+                  get() = read("anim", 1, 2)
+                  set(v) = write("anim", v)
+
+              var dim: Int
+                  get() = read("dim", 2, DIM_NAMES.size)
+                  set(v) = write("dim", v)
+
+              /** Tandai foto latar berganti supaya launcher menggambar ulang. */
+              fun touchWallpaper() {
+                  lookSp.edit().putLong("wpver", System.currentTimeMillis()).apply()
+              }
+
+              fun resetLook() {
+                  lookSp.edit().clear().apply()
+              }
+
+              // ---- Pengaturan aplikasi: 0 = tampil, 1 = tampil di atas (favorit), 2 = disembunyikan ----
+
+              private fun stringSet(key: String): HashSet<String> {
+                  val s = appsSp.getStringSet(key, null)
+                  return if (s == null) HashSet() else HashSet(s)
+              }
+
+              fun appState(pkg: String): Int {
+                  if (stringSet("pinned").contains(pkg)) return 1
+                  if (stringSet("hidden").contains(pkg)) return 2
+                  return 0
+              }
+
+              fun setAppState(pkg: String, state: Int) {
+                  val hidden = stringSet("hidden")
+                  val pinned = stringSet("pinned")
+                  hidden.remove(pkg)
+                  pinned.remove(pkg)
+                  if (state == 1) pinned.add(pkg)
+                  if (state == 2) hidden.add(pkg)
+                  appsSp.edit().putStringSet("hidden", hidden).putStringSet("pinned", pinned).apply()
+              }
+
+              fun showAll() {
+                  appsSp.edit().putStringSet("hidden", HashSet<String>()).apply()
+              }
+
+              fun hideAll(pkgs: List<String>) {
+                  appsSp.edit()
+                      .putStringSet("hidden", HashSet<String>(pkgs))
+                      .putStringSet("pinned", HashSet<String>())
+                      .apply()
+              }
+
+              /** Aplikasi yang tampil di launcher: favorit di atas, sisanya urut abjad. */
+              fun visible(all: List<AppEntry>): List<AppEntry> {
+                  val hidden = stringSet("hidden")
+                  val pinned = stringSet("pinned")
+                  val shown = all.filter { !hidden.contains(it.pkg) }
+                  return shown.filter { pinned.contains(it.pkg) } + shown.filter { !pinned.contains(it.pkg) }
+              }
+
+              /** Berubah setiap kali ada pengaturan yang diubah; dipakai untuk tahu kapan layar perlu digambar ulang. */
+              fun signature(): String = lookSp.all.toString() + appsSp.all.toString()
+
+              companion object {
+                  val ACCENT_NAMES = arrayOf("Biru", "Hijau", "Oranye", "Ungu", "Merah", "Cyan", "Pink")
+                  val ACCENTS = intArrayOf(
+                      Color.parseColor("#3D7BFF"),
+                      Color.parseColor("#2ECC71"),
+                      Color.parseColor("#FF8A3D"),
+                      Color.parseColor("#9B6BFF"),
+                      Color.parseColor("#FF4D5E"),
+                      Color.parseColor("#22C7D6"),
+                      Color.parseColor("#FF5FA2")
+                  )
+                  val BG_NAMES = arrayOf(
+                      "Gelap", "Hitam pekat", "Aurora tenang", "Laut tenang",
+                      "Hutan berkabut", "Lavender senja", "Terang", "Foto sendiri"
+                  )
+                  val DIM_NAMES = arrayOf("Tanpa", "25%", "50%", "75%")
+                  val CARD_NAMES = arrayOf("Solid", "Kaca (transparan)", "Tanpa kartu")
+                  val RADIUS_NAMES = arrayOf("Tajam", "Sedang", "Bulat")
+                  val ICON_NAMES = arrayOf("Kecil", "Sedang", "Besar")
+                  val COLUMN_NAMES = arrayOf("Otomatis", "4", "5", "6", "7", "8")
+                  val COLUMN_VALUES = intArrayOf(0, 4, 5, 6, 7, 8)
+                  val SHOW_NAMES = arrayOf("Sembunyi", "Tampil")
+                  val ON_NAMES = arrayOf("Mati", "Hidup")
+                  val CLOCK_NAMES = arrayOf("24 jam", "12 jam")
+              }
+          }
+          EOF_RINGAN
+          cat > app/src/main/java/id/ringan/launcher/SettingsActivity.kt <<'EOF_RINGAN'
+          package id.ringan.launcher
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.KeyEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          /** Layar "Atur Tampilan": setiap baris punya beberapa pilihan yang diputar dengan OK atau kiri/kanan. */
+          class SettingsActivity : ListPage() {
+
+              private class Row(
+                  val title: String,
+                  val choices: Array<String>?,
+                  val read: () -> Int,
+                  val write: (Int) -> Unit,
+                  val action: (() -> Unit)?
+              )
+
+              private class Holder(val title: TextView, val value: TextView)
+
+              override val pageTitle: String
+                  get() = "Atur Tampilan"
+
+              override val pageHint: String
+                  get() = "OK atau tombol kiri/kanan: ganti pilihan     Back: kembali"
+
+              private var rows: List<Row> = emptyList()
+              private val adapter = RowAdapter()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val p = prefs
+                  rows = listOf(
+                      Row("Aplikasi yang ditampilkan", null, { 0 }, { }, {
+                          startActivity(Intent(this, ManageAppsActivity::class.java))
+                      }),
+                      Row("Warna aksen", Prefs.ACCENT_NAMES, { p.accent }, { p.accent = it }, null),
+                      Row("Latar belakang", Prefs.BG_NAMES, { p.background }, { p.background = it }, null),
+                      Row("Pilih foto latar", null, { 0 }, { }, {
+                          startActivity(Intent(this, WallpaperActivity::class.java))
+                      }),
+                      Row("Redupkan foto latar", Prefs.DIM_NAMES, { p.dim }, { p.dim = it }, null),
+                      Row("Gaya kartu", Prefs.CARD_NAMES, { p.cardStyle }, { p.cardStyle = it }, null),
+                      Row("Sudut kartu", Prefs.RADIUS_NAMES, { p.radius }, { p.radius = it }, null),
+                      Row("Ukuran ikon", Prefs.ICON_NAMES, { p.iconSize }, { p.iconSize = it }, null),
+                      Row("Jumlah kolom", Prefs.COLUMN_NAMES, { p.columns }, { p.columns = it }, null),
+                      Row("Nama aplikasi", Prefs.SHOW_NAMES, { p.showLabel }, { p.showLabel = it }, null),
+                      Row("Jam", Prefs.SHOW_NAMES, { p.showClock }, { p.showClock = it }, null),
+                      Row("Format jam", Prefs.CLOCK_NAMES, { p.clockFormat }, { p.clockFormat = it }, null),
+                      Row("Tanggal", Prefs.SHOW_NAMES, { p.showDate }, { p.showDate = it }, null),
+                      Row("Info RAM", Prefs.SHOW_NAMES, { p.showRam }, { p.showRam = it }, null),
+                      Row("Animasi saat disorot (matikan jika terasa berat)", Prefs.ON_NAMES, { p.animate }, { p.animate = it }, null),
+                      Row("Kembalikan tampilan ke awal", null, { 0 }, { }, {
+                          p.resetLook()
+                          afterChange()
+                      })
+                  )
+
+                  listView.adapter = adapter
+                  listView.setOnItemClickListener { _, _, position, _ ->
+                      val row = rows[position]
+                      val action = row.action
+                      if (action != null) action() else step(row, 1)
+                  }
+                  listView.requestFocus()
+              }
+
+              // Kembali dari layar pilih foto atau pilih aplikasi: segarkan tampilan
+              override fun onResume() {
+                  super.onResume()
+                  applyLook()
+                  adapter.notifyDataSetChanged()
+              }
+
+              // Tombol kiri/kanan memutar pilihan pada baris yang sedang disorot
+              override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                  if (event.action == KeyEvent.ACTION_DOWN &&
+                      (event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT || event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)
+                  ) {
+                      val pos = listView.selectedItemPosition
+                      if (pos >= 0 && pos < rows.size && rows[pos].choices != null) {
+                          step(rows[pos], if (event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1)
+                          return true
+                      }
+                  }
+                  return super.dispatchKeyEvent(event)
+              }
+
+              private fun step(row: Row, delta: Int) {
+                  val choices = row.choices ?: return
+                  val n = choices.size
+                  row.write(((row.read() + delta) % n + n) % n)
+                  afterChange()
+              }
+
+              private fun afterChange() {
+                  applyLook()
+                  adapter.notifyDataSetChanged()
+              }
+
+              private inner class RowAdapter : BaseAdapter() {
+                  override fun getCount(): Int = rows.size
+
+                  override fun getItem(position: Int): Any = rows[position]
+
+                  override fun getItemId(position: Int): Long = position.toLong()
+
+                  override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                      val holder: Holder
+                      val view: View
+                      if (convertView == null) {
+                          val container = LinearLayout(this@SettingsActivity)
+                          container.orientation = LinearLayout.HORIZONTAL
+                          container.gravity = Gravity.CENTER_VERTICAL
+                          container.setPadding(look.dp(24), look.dp(14), look.dp(24), look.dp(14))
+
+                          val title = TextView(this@SettingsActivity)
+                          title.textSize = 20f
+                          container.addView(
+                              title,
+                              LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                          )
+
+                          val value = TextView(this@SettingsActivity)
+                          value.textSize = 18f
+                          container.addView(
+                              value,
+                              LinearLayout.LayoutParams(
+                                  ViewGroup.LayoutParams.WRAP_CONTENT,
+                                  ViewGroup.LayoutParams.WRAP_CONTENT
+                              )
+                          )
+
+                          holder = Holder(title, value)
+                          container.tag = holder
+                          view = container
+                      } else {
+                          view = convertView
+                          holder = convertView.tag as Holder
+                      }
+
+                      val row = rows[position]
+                      holder.title.text = row.title
+                      holder.title.setTextColor(look.textPrimary)
+                      val choices = row.choices
+                      holder.value.text = if (choices != null) {
+                          "‹   " + choices[row.read()] + "   ›"
+                      } else {
+                          "›"
+                      }
+                      holder.value.setTextColor(look.accent)
+                      return view
+                  }
+              }
+          }
+          EOF_RINGAN
+          cat > app/src/main/java/id/ringan/launcher/SoftBackground.kt <<'EOF_RINGAN'
+          package id.ringan.launcher
+
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.ColorFilter
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.PixelFormat
+          import android.graphics.RadialGradient
+          import android.graphics.Rect
+          import android.graphics.Shader
+          import android.graphics.drawable.Drawable
+
+          /**
+           * Latar tenang tanpa gambar: gradasi gelap lembut ditambah beberapa "cahaya" besar yang kabur.
+           * Digambar langsung dari shader, jadi tidak memakai memori bitmap dan tidak berat.
+           */
+          class SoftBackground(
+              private val base: IntArray,
+              private val glows: Array<Glow>
+          ) : Drawable() {
+
+              /** Posisi (cx, cy) dan radius dinyatakan sebagai pecahan dari lebar/tinggi layar. */
+              class Glow(val cx: Float, val cy: Float, val radius: Float, val color: Int)
+
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private var baseShader: Shader? = null
+              private var glowShaders: List<Shader> = emptyList()
+
+              override fun onBoundsChange(bounds: Rect) {
+                  val w = bounds.width().toFloat()
+                  val h = bounds.height().toFloat()
+                  baseShader = LinearGradient(0f, 0f, w * 0.5f, h, base, null, Shader.TileMode.CLAMP)
+                  glowShaders = glows.map {
+                      RadialGradient(
+                          w * it.cx,
+                          h * it.cy,
+                          w * it.radius,
+                          it.color,
+                          it.color and 0x00FFFFFF,
+                          Shader.TileMode.CLAMP
+                      )
+                  }
+              }
+
+              override fun draw(canvas: Canvas) {
+                  val area = bounds
+                  paint.shader = baseShader
+                  canvas.drawRect(area, paint)
+                  for (shader in glowShaders) {
+                      paint.shader = shader
+                      canvas.drawRect(area, paint)
+                  }
+              }
+
+              override fun setAlpha(alpha: Int) {
+              }
+
+              override fun setColorFilter(colorFilter: ColorFilter?) {
+              }
+
+              @Suppress("OVERRIDE_DEPRECATION")
+              override fun getOpacity(): Int = PixelFormat.OPAQUE
+
+              companion object {
+                  private fun c(hex: String): Int = Color.parseColor(hex)
+
+                  /** Biru malam dengan cahaya teal dan ungu lembut. */
+                  fun aurora(): SoftBackground = SoftBackground(
+                      intArrayOf(c("#0E1424"), c("#13263B"), c("#0F1A2A")),
+                      arrayOf(
+                          Glow(0.85f, 0.10f, 0.65f, c("#4022C7D6")),
+                          Glow(0.10f, 0.95f, 0.75f, c("#407A5CFF"))
+                      )
+                  )
+
+                  /** Biru laut dalam dengan cahaya cyan. */
+                  fun ocean(): SoftBackground = SoftBackground(
+                      intArrayOf(c("#0A1A24"), c("#0F2F3F"), c("#0B1F2C")),
+                      arrayOf(
+                          Glow(0.20f, 0.15f, 0.65f, c("#3840C4D8")),
+                          Glow(0.90f, 0.95f, 0.70f, c("#382B6CFF"))
+                      )
+                  )
+
+                  /** Hijau gelap berkabut dengan sentuhan hangat. */
+                  fun forest(): SoftBackground = SoftBackground(
+                      intArrayOf(c("#0B1713"), c("#12261F"), c("#0D1C17")),
+                      arrayOf(
+                          Glow(0.80f, 0.15f, 0.65f, c("#3544C79A")),
+                          Glow(0.10f, 0.90f, 0.70f, c("#25C9B27A"))
+                      )
+                  )
+
+                  /** Ungu senja dengan cahaya pink dan indigo. */
+                  fun dusk(): SoftBackground = SoftBackground(
+                      intArrayOf(c("#17122B"), c("#2A1B3F"), c("#1B1530")),
+                      arrayOf(
+                          Glow(0.85f, 0.20f, 0.65f, c("#44FF8FB1")),
+                          Glow(0.15f, 0.85f, 0.75f, c("#447A6BFF"))
+                      )
+                  )
+              }
+          }
+          EOF_RINGAN
+          cat > app/src/main/java/id/ringan/launcher/WallpaperActivity.kt <<'EOF_RINGAN'
+          package id.ringan.launcher
+
+          import android.Manifest
+          import android.content.ContentUris
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+          import java.io.FileOutputStream
+
+          /**
+           * Pilih foto dari penyimpanan TV sebagai latar. Foto dipotong 16:9 dan diperkecil
+           * ke 1280x720 lalu disimpan di dalam aplikasi, jadi tetap ringan dan tidak butuh izin lagi.
+           */
+          class WallpaperActivity : ListPage() {
+
+              private class Photo(val id: Long, val name: String)
+
+              override val pageTitle: String
+                  get() = "Pilih Foto Latar"
+
+              override val pageHint: String
+                  get() = "Foto harus ada di penyimpanan TV (misalnya folder Download), rasio 16:9 paling bagus     Back: batal"
+
+              private var photos: List<Photo> = emptyList()
+              private var busy = false
+              private val adapter = PhotoAdapter()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  listView.adapter = adapter
+                  listView.setOnItemClickListener { _, _, position, _ ->
+                      if (position < photos.size && !busy) useAsWallpaper(photos[position])
+                  }
+                  listView.requestFocus()
+
+                  if (hasPermission()) {
+                      loadPhotos()
+                  } else {
+                      requestPermissions(arrayOf(permissionName()), 1)
+                  }
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                      loadPhotos()
+                  } else {
+                      Toast.makeText(this, "Izin membaca foto ditolak", Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              private fun permissionName(): String =
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      Manifest.permission.READ_MEDIA_IMAGES
+                  } else {
+                      Manifest.permission.READ_EXTERNAL_STORAGE
+                  }
+
+              private fun hasPermission(): Boolean =
+                  Build.VERSION.SDK_INT < 23 ||
+                      checkSelfPermission(permissionName()) == PackageManager.PERMISSION_GRANTED
+
+              private fun loadPhotos() {
+                  val result = ArrayList<Photo>()
+                  val cursor = contentResolver.query(
+                      MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                      arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME),
+                      null,
+                      null,
+                      MediaStore.Images.Media.DATE_ADDED + " DESC"
+                  )
+                  if (cursor != null) {
+                      cursor.use {
+                          while (it.moveToNext() && result.size < 300) {
+                              result.add(Photo(it.getLong(0), it.getString(1) ?: "foto"))
+                          }
+                      }
+                  }
+                  photos = result
+                  adapter.notifyDataSetChanged()
+              }
+
+              private fun useAsWallpaper(photo: Photo) {
+                  busy = true
+                  Toast.makeText(this, "Memproses foto...", Toast.LENGTH_SHORT).show()
+                  Thread {
+                      val ok = saveWallpaper(photo.id)
+                      runOnUiThread {
+                          busy = false
+                          if (ok) {
+                              prefs.background = 7
+                              prefs.touchWallpaper()
+                              Toast.makeText(this, "Foto latar dipasang", Toast.LENGTH_SHORT).show()
+                              finish()
+                          } else {
+                              Toast.makeText(this, "Foto tidak bisa dipakai", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun saveWallpaper(id: Long): Boolean {
+                  return try {
+                      val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+
+                      val bounds = BitmapFactory.Options()
+                      bounds.inJustDecodeBounds = true
+                      contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                      if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return false
+
+                      var sample = 1
+                      while (bounds.outWidth / (sample * 2) >= TARGET_W && bounds.outHeight / (sample * 2) >= TARGET_H) {
+                          sample *= 2
+                      }
+                      val options = BitmapFactory.Options()
+                      options.inSampleSize = sample
+                      options.inPreferredConfig = Bitmap.Config.RGB_565
+                      val source = contentResolver.openInputStream(uri)?.use {
+                          BitmapFactory.decodeStream(it, null, options)
+                      } ?: return false
+
+                      // Potong bagian tengah menjadi 16:9
+                      val w = source.width
+                      val h = source.height
+                      val cropW: Int
+                      val cropH: Int
+                      if (w.toFloat() / h > 16f / 9f) {
+                          cropH = h
+                          cropW = (h * 16f / 9f).toInt()
+                      } else {
+                          cropW = w
+                          cropH = (w * 9f / 16f).toInt()
+                      }
+                      val cropped = Bitmap.createBitmap(source, (w - cropW) / 2, (h - cropH) / 2, cropW, cropH)
+                      val scaled = Bitmap.createScaledBitmap(cropped, TARGET_W, TARGET_H, true)
+
+                      FileOutputStream(File(filesDir, "wallpaper.jpg")).use {
+                          scaled.compress(Bitmap.CompressFormat.JPEG, 90, it)
+                      }
+                      true
+                  } catch (e: Throwable) {
+                      false
+                  }
+              }
+
+              private inner class PhotoAdapter : BaseAdapter() {
+                  override fun getCount(): Int = if (photos.isEmpty()) 1 else photos.size
+
+                  override fun getItem(position: Int): Any = position
+
+                  override fun getItemId(position: Int): Long = position.toLong()
+
+                  override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                      val view: TextView = if (convertView is TextView) {
+                          convertView
+                      } else {
+                          val t = TextView(this@WallpaperActivity)
+                          t.textSize = 20f
+                          t.setPadding(look.dp(24), look.dp(14), look.dp(24), look.dp(14))
+                          t.maxLines = 1
+                          t
+                      }
+                      if (photos.isEmpty()) {
+                          view.text = "Tidak ada foto di penyimpanan TV. Salin foto ke folder Download lalu buka layar ini lagi."
+                          view.setTextColor(look.textSecondary)
+                      } else {
+                          view.text = photos[position].name
+                          view.setTextColor(look.textPrimary)
+                      }
+                      return view
+                  }
+              }
+
+              companion object {
+                  private const val TARGET_W = 1280
+                  private const val TARGET_H = 720
+              }
+          }
+          EOF_RINGAN
+          cat > app/src/main/res/drawable/banner.xml <<'EOF_RINGAN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="320dp"
+              android:height="180dp"
+              android:viewportWidth="320"
+              android:viewportHeight="180">
+              <path
+                  android:fillColor="#101418"
+                  android:pathData="M0,0h320v180h-320z" />
+              <path
+                  android:fillColor="#2B6CFF"
+                  android:pathData="M130,60h24v24h-24zM166,60h24v24h-24zM130,96h24v24h-24zM166,96h24v24h-24z" />
+          </vector>
+          EOF_RINGAN
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF_RINGAN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp"
+              android:height="48dp"
+              android:viewportWidth="48"
+              android:viewportHeight="48">
+              <path
+                  android:fillColor="#2B6CFF"
+                  android:pathData="M8,0h32a8,8 0 0 1 8,8v32a8,8 0 0 1 -8,8H8a8,8 0 0 1 -8,-8V8a8,8 0 0 1 8,-8z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M12,12h10v10H12zM26,12h10v10H26zM12,26h10v10H12zM26,26h10v10H26z" />
+          </vector>
+          EOF_RINGAN
+          cat > app/src/main/res/layout/activity_main.xml <<'EOF_RINGAN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:clipChildren="false"
+              android:clipToPadding="false"
+              android:orientation="vertical"
+              android:paddingLeft="48dp"
+              android:paddingTop="28dp"
+              android:paddingRight="48dp"
+              android:paddingBottom="12dp">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:clipChildren="false"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <LinearLayout
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:orientation="vertical">
+
+                      <TextClock
+                          android:id="@+id/clock"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:fontFamily="sans-serif-light"
+                          android:format12Hour="HH:mm"
+                          android:format24Hour="HH:mm"
+                          android:includeFontPadding="false"
+                          android:textSize="56sp" />
+
+                      <TextClock
+                          android:id="@+id/date"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:format12Hour="EEEE, d MMMM"
+                          android:format24Hour="EEEE, d MMMM"
+                          android:textSize="16sp" />
+                  </LinearLayout>
+
+                  <View
+                      android:layout_width="0dp"
+                      android:layout_height="1dp"
+                      android:layout_weight="1" />
+
+                  <TextView
+                      android:id="@+id/ram"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginRight="16dp"
+                      android:textSize="14sp" />
+
+                  <TextView
+                      android:id="@+id/btn_clean"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:clickable="true"
+                      android:focusable="true"
+                      android:paddingLeft="18dp"
+                      android:paddingTop="9dp"
+                      android:paddingRight="18dp"
+                      android:paddingBottom="9dp"
+                      android:text="Bersihkan RAM"
+                      android:textSize="15sp" />
+
+                  <TextView
+                      android:id="@+id/btn_launcher"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginLeft="10dp"
+                      android:clickable="true"
+                      android:focusable="true"
+                      android:paddingLeft="18dp"
+                      android:paddingTop="9dp"
+                      android:paddingRight="18dp"
+                      android:paddingBottom="9dp"
+                      android:text="Atur Launcher"
+                      android:textSize="15sp" />
+
+                  <TextView
+                      android:id="@+id/btn_settings"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginLeft="10dp"
+                      android:clickable="true"
+                      android:focusable="true"
+                      android:paddingLeft="18dp"
+                      android:paddingTop="9dp"
+                      android:paddingRight="18dp"
+                      android:paddingBottom="9dp"
+                      android:text="Pengaturan TV"
+                      android:textSize="15sp" />
+              </LinearLayout>
+
+              <FrameLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_marginTop="16dp"
+                  android:layout_weight="1"
+                  android:clipChildren="false"
+                  android:clipToPadding="false">
+
+                  <androidx.recyclerview.widget.RecyclerView
+                      android:id="@+id/list"
+                      android:layout_width="match_parent"
+                      android:layout_height="match_parent"
+                      android:clipChildren="false"
+                      android:clipToPadding="false"
+                      android:paddingLeft="8dp"
+                      android:paddingTop="10dp"
+                      android:paddingRight="8dp"
+                      android:paddingBottom="10dp"
+                      android:scrollbars="none" />
+
+                  <TextView
+                      android:id="@+id/empty"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_gravity="center"
+                      android:gravity="center"
+                      android:text="Belum ada aplikasi yang ditampilkan.\nBuka Atur Launcher, lalu Aplikasi yang ditampilkan."
+                      android:textSize="18sp"
+                      android:visibility="gone" />
+              </FrameLayout>
+
+              <TextView
+                  android:id="@+id/hint"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:gravity="center"
+                  android:paddingTop="6dp"
+                  android:text="OK: buka     Menu atau tahan OK: info / hapus aplikasi"
+                  android:textSize="12sp" />
+          </LinearLayout>
+          EOF_RINGAN
+          cat > app/src/main/res/layout/item_app.xml <<'EOF_RINGAN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="wrap_content"
+              android:layout_margin="6dp"
+              android:clickable="true"
+              android:descendantFocusability="blocksDescendants"
+              android:focusable="true"
+              android:gravity="center_horizontal"
+              android:orientation="vertical"
+              android:padding="14dp">
+
+              <ImageView
+                  android:id="@+id/icon"
+                  android:layout_width="64dp"
+                  android:layout_height="64dp"
+                  android:scaleType="fitCenter" />
+
+              <TextView
+                  android:id="@+id/label"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="8dp"
+                  android:ellipsize="end"
+                  android:gravity="center"
+                  android:maxLines="1"
+                  android:textSize="14sp" />
+          </LinearLayout>
+          EOF_RINGAN
+          cat > app/src/main/res/values/colors.xml <<'EOF_RINGAN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="bg">#101418</color>
+          </resources>
+          EOF_RINGAN
+          cat > app/src/main/res/values/styles.xml <<'EOF_RINGAN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:windowAnimationStyle">@null</item>
+              </style>
+          </resources>
+          EOF_RINGAN
+          cat > build.gradle.kts <<'EOF_RINGAN'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_RINGAN
+          cat > gradle.properties <<'EOF_RINGAN'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF_RINGAN
+          cat > settings.gradle.kts <<'EOF_RINGAN'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "RinganLauncher"
+          include(":app")
+          EOF_RINGAN
+
+      - name: Build APK
+        run: gradle assembleRelease assembleDebug --no-daemon --stacktrace
+
+      - name: Simpan sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RinganLauncher-apk
+          path: app/build/outputs/apk/*/*.apk
+
+      - name: Terbitkan di Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Ringan Launcher build ${{ github.run_number }}
+          body: "Pasang app-release.apk di TV. Jika gagal dipasang, pakai app-debug.apk."
+          files: |
+            app/build/outputs/apk/release/app-release.apk
+            app/build/outputs/apk/debug/app-debug.apk
